@@ -1,5 +1,5 @@
 git-vain: git-vain.c
-	cc git-vain.c -O3 -g -o git-vain
+	$(CC) $< -o $@ #-O3 -g -lcrypto -pthread -lm -Wall -DUSE_OPENSSL -DNO_STRLCPY
 
 install: git-vain
 	cp git-vain /usr/local/bin

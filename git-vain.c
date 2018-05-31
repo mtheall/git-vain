@@ -5,22 +5,72 @@
 #include <stdbool.h>
 #include <unistd.h> // for read
 #include <pthread.h>
-#define MAX_THREADS 8
 
-//#include <openssl/sha.h> // needs -lcrypto
+#if __STDC_VERSION__ >= 201112L
+#include <stdatomic.h>
+#endif
+
+#define MAX_THREADS 8
+#define SPIRAL_MAX 3600
+
+#ifdef USE_OPENSSL
+#include <openssl/sha.h> // needs -lcrypto
+typedef SHA_CTX        CC_SHA1_CTX;
+#define CC_SHA1_Init   SHA1_Init
+#define CC_SHA1_Update SHA1_Update
+#define CC_SHA1_Final  SHA1_Final
+#else
 #include <CommonCrypto/CommonDigest.h>
+#endif
+
 #ifndef SHA_DIGEST_LENGTH
   #define SHA_DIGEST_LENGTH CC_SHA1_DIGEST_LENGTH
 #endif
 
+#ifdef NO_STRLCPY
+size_t strlcpy(char *dst, const char *src, size_t size)
+{
+  if(size > 0)
+  {
+    strncpy(dst, src, size-1);
+    dst[size-1] = '\0';
+  }
+
+  return strlen(src);
+}
+#endif
+
 #define MAX_MESSAGE 17
+
+#if __STDC_VERSION__ < 201112L
+#warning "Using fake atomic routines"
+typedef int atomic_bool;
+typedef int atomic_int;
+
+static inline atomic_int atomic_load(volatile atomic_int *data)
+{
+  return *data;
+}
+
+static inline void atomic_fetch_add(volatile atomic_int *data, int addend)
+{
+  *data += addend;
+}
+
+static inline bool atomic_flag_test_and_set(volatile atomic_int *data)
+{
+  bool prev = *data;
+  *data = true;
+  return prev;
+}
+#endif
 
 int headerLen, commitLen, messageLen, dateLen, authOffset, commOffset, authDate, commDate;
 char message[MAX_MESSAGE];
 unsigned char hexMessage[MAX_MESSAGE/2];
 bool dry_run = false;
-volatile bool found = false;
-int count=0;
+atomic_bool found = false;
+atomic_int count=0;
 CC_SHA1_CTX gctx;
 
 void setFromGitConfig(char *message) {
@@ -73,16 +123,12 @@ char* getCommit() {
 
   int len = strlen(commitbuff);
   char header[20];
-  sprintf(header, "commit %d", len);
-  int headlen = strlen(header);
-  len += headlen+1;
+  int headlen = sprintf(header, "commit %d", len) + 1;
 
-  char * commit = malloc(len+2);
+  char * commit = malloc(len+headlen+1);
   memcpy(commit, header, headlen);
-  commit[headlen+1] = '\0';
-  memcpy(commit+headlen+1, commitbuff, len);
-  commit[len+1] = '\n';
-  commit[len+2] = '\0';
+  memcpy(commit+headlen, commitbuff, len);
+  commit[headlen+len] = '\0';
 
   return commit;
 }
@@ -127,12 +173,9 @@ int dateAtOffset(int offset, char *commit) {
 
 void mytoa(int val, char *dst) {
   int i = dateLen-1;
-  int m,v;
   for(; i ; --i) {
-    v = val / 10;
-    m = val % 10;
-    dst[i] = m+'0';
-    val = v;
+    dst[i] = (val%10)+'0';
+    val /= 10;
   }
 }
 
@@ -153,9 +196,9 @@ bool shacmp(unsigned char *sha) {
   return true;
 }
 
-void spiral_pair(int n, int *x, int *y) {
+void spiral_pair(int sq, int n, int *x, int *y) {
   // http://2000clicks.com/mathhelp/CountingRationalsSquareSpiral1.aspx
-  int s = (sqrt(n)+1)/2;
+  int s = (sq+1)/2;
   int lt = n-( ((2*s)-1) * ((2*s)-1) );
   int l = lt / (2*s);
   int e = lt - (2*s*l) - s+1;
@@ -172,12 +215,12 @@ int spiral_max(int max_side) {
   return  (max_side*2+1) * (max_side*2+1) - 1;
 }
 
-void ammend_commit(char *newCommit, unsigned char *sha, int da, int dc) {
+void amend_commit(char *newCommit, unsigned char *sha, int da, int dc) {
   char progHash[SHA_DIGEST_LENGTH*2+1];
   for(int i=0; i<SHA_DIGEST_LENGTH; i++) {
     sprintf(progHash+i*2, "%02x", sha[i]);
   }
-  printf("∆a: %d, ∆c: %d, khash: %d\n%s\n",da,dc, count/1000, progHash);
+  printf("∆a: %d, ∆c: %d, khash: %d\n%s\n",da,dc, atomic_load(&count)/1000, progHash);
 
   if (dry_run) { return; }
 
@@ -196,7 +239,7 @@ void ammend_commit(char *newCommit, unsigned char *sha, int da, int dc) {
 
   if (strcmp(gitHash,progHash)) {
     puts("prepared commit hash differs from what git thinks") ;
-    printf("us: %s\ngit: %s\n",gitHash,progHash);
+    printf("us: %s\ngit: %s\n",progHash,gitHash);
     exit(1);
   }
 
@@ -219,19 +262,19 @@ void ammend_commit(char *newCommit, unsigned char *sha, int da, int dc) {
 
 typedef struct {
   int start;
-  int skip;
   char* commit;
 } searchArgs;
 
 void *Display(){
-  int last = count;
-  for(;;) {
-    if (found) { return NULL; }
-    printf("khash: %5d (%0.1f Mh/s)\r", count/1000, ((float)count-last)/1000000);
+  int last = atomic_load(&count);
+  while (!atomic_load(&found)) {
+    int lastCount = atomic_load(&count);
+    printf("khash: %5d (%0.1f Mh/s)\r", lastCount/1000, ((float)lastCount-last)/1000000);
     fflush(stdout);
-    last = count;
+    last = lastCount;
     sleep(1);
   }
+
   return NULL;
 }
 
@@ -245,28 +288,36 @@ void *Search(void* argsptr){
   unsigned char hash[SHA_DIGEST_LENGTH];
 
   int da, dc;
-  int max = spiral_max(3600);
+  int max = spiral_max(SPIRAL_MAX);
 
   const void * newCommitPartial = newCommit+authOffset;
-  int commitLenParital = commitLen-authOffset;
+  int commitLenPartial = commitLen-authOffset;
 
-  for(int n=args.start; n < max; n=n+args.skip) {
-    count++;
-    //if (found) { return NULL; } //guarding later in racey successes
+  int squareRoot = sqrt(args.start);
+  int nextSquare = (squareRoot+1) * (squareRoot+1);
 
-    spiral_pair(n, &da, &dc);
+  for(int n=args.start; n < max; n+=MAX_THREADS) {
+    atomic_fetch_add(&count, 1);
+    //if (atomic_load(&found)) { return NULL; } //guarding later in racey successes
+
+    if (n >= nextSquare) {
+      squareRoot = sqrt(n);
+      nextSquare = (squareRoot+1) * (squareRoot+1);
+    }
+
+    spiral_pair(squareRoot, n, &da, &dc);
     alter(newCommit, authOffset, authDate+da, commOffset, commDate+dc);
 
     CC_SHA1_CTX ctx = gctx;
-    CC_SHA1_Update(&ctx, newCommitPartial, commitLenParital);
+    CC_SHA1_Update(&ctx, newCommitPartial, commitLenPartial);
     CC_SHA1_Final(hash, &ctx);
 
     if (shacmp(hash)) {
-      if (found) { return NULL; } //another thread beat us
-      found = true;
-      ammend_commit(newCommit, hash, da, dc);
+      if (atomic_flag_test_and_set(&found)) { return NULL; } //another thread beat us
+      amend_commit(newCommit, hash, da, dc);
     }
   }
+
   return NULL;
 }
 
@@ -298,12 +349,10 @@ int main(int argc, char *argv[]) {
   }
 
   char * commit = getCommit();
-  char * commitMsg = commit;
-  //advance commit past header
-  for (; *commitMsg != '\0'; commitMsg++) { }
-  commitMsg++;
-  headerLen = commitMsg - commit;
-  commitLen = strlen(commit) + 1 + strlen(commitMsg);
+
+  headerLen = strlen(commit) + 1;
+  char * commitMsg = commit + headerLen;
+  commitLen = headerLen + strlen(commitMsg);
 
   authOffset = getTimeOffset("\nauthor ",   commit);
   commOffset = getTimeOffset("\ncommitter ",commit);
@@ -324,15 +373,23 @@ int main(int argc, char *argv[]) {
   pthread_t threads[MAX_THREADS+1];
   searchArgs thread_args[MAX_THREADS];
   for(int i=0; i<MAX_THREADS; i++) {
-    searchArgs args = { i+1,MAX_THREADS, commit};
+    searchArgs args = { i+1, commit };
     thread_args[i] = args;
     pthread_create(&threads[i], NULL, Search, (void *) &thread_args[i]);
   }
   pthread_create(&threads[MAX_THREADS], NULL, Display, NULL);
+
   for(int i=0; i<MAX_THREADS; i++) {
     pthread_join(threads[i], NULL);
   }
 
+  // make display thread quit
+  if(! atomic_flag_test_and_set(&found))
+    printf("\nDidn't find a match\n");
+
+  pthread_join(threads[MAX_THREADS], NULL);
+
+  free(commit);
+
   return 0;
 }
-
